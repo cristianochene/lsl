@@ -17,12 +17,17 @@
 
 ## Benchmarks
 
-Benchmarked using [`hyperfine`](https://github.com/sharkdp/hyperfine) on Linux without shell startup overhead (`-N` flag):
+## Benchmarks
 
-| Command | Mean Runtime ± σ | Speedup |
+| Command | Execution Time (Mean ± σ) | Relative Speed |
 | :--- | :--- | :--- |
-| **`lsl`** | **794.9 µs ± 65.1 µs** | **1.00 (Fastest)** |
-| `ls -la` | 1.4 ms ± 0.1 ms | 1.80x slower |
+| **`lsl '.'`** | **687.3 µs ± 69.4 µs** | **1.00x (Fastest)** |
+| **`ls -la '.'`** | 1.5 ms ± 0.1 ms | 2.12x slower |
+| **`lsd -la '.'`** | 3.0 ms ± 0.2 ms | 4.41x slower |
+| **`eza -la '.'`** | 3.0 ms ± 0.2 ms | 4.42x slower |
+
+`lsl` runs **~2.1x faster than standard GNU `ls`** and **~4.4x faster than modern Rust-based alternatives (`eza`, `lsd`)**.
+
 
 ---
 
