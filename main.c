@@ -112,7 +112,27 @@ static int entry_index(lua_State *L){Entry*e=lua_entry(L);const char*k=luaL_chec
 static int push_entry(lua_State*L,Entry*e){Entry**u=lua_newuserdata(L,sizeof(*u));*u=e;luaL_getmetatable(L,"lsl.entry");lua_setmetatable(L,-2);return 1;}
 static lua_State *start_lua(const char *path){lua_State*L=luaL_newstate();if(!L)return NULL;luaL_openlibs(L);luaL_newmetatable(L,"lsl.entry");lua_pushcfunction(L,entry_index);lua_setfield(L,-2,"__index");lua_pop(L,1);if(luaL_dofile(L,path)!=LUA_OK){fprintf(stderr,"lsl: %s\n",lua_tostring(L,-1));lua_close(L);return NULL;}return L;}
 static int lua_accept(lua_State*L,Entry*e){lua_getglobal(L,"filter_entry");if(!lua_isfunction(L,-1)){lua_pop(L,1);return 1;}push_entry(L,e);if(lua_pcall(L,1,1,0)!=LUA_OK){fprintf(stderr,"lsl: filter_entry: %s\n",lua_tostring(L,-1));lua_pop(L,1);return 0;}int ok=lua_toboolean(L,-1);lua_pop(L,1);return ok;}
-static const char *lua_format(lua_State*L,Entry*e,size_t*n){lua_getglobal(L,"format_entry");if(!lua_isfunction(L,-1)){lua_pop(L,1);return NULL;}push_entry(L,e);if(lua_pcall(L,1,1,0)!=LUA_OK){fprintf(stderr,"lsl: format_entry: %s\n",lua_tostring(L,-1));lua_pop(L,1);return NULL;}return lua_tolstring(L,-1,n);}
+static const char *lua_format(lua_State *L, Entry *e, size_t *length) {
+    lua_getglobal(L, "format_entry");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        return NULL;
+    }
+
+    push_entry(L, e);
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        fprintf(stderr, "lsl: format_entry: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return NULL;
+    }
+
+    const char *formatted = lua_tolstring(L, -1, length);
+    if (!formatted) {
+        fprintf(stderr, "lsl: format_entry must return a string\n");
+        lua_pop(L, 1);
+    }
+    return formatted;
+}
 #endif
 
 static void usage(FILE*f){fprintf(f,"Usage: lsl [OPTIONS] [DIR]\n  -a, --all       show hidden entries\n  -l, --long      load and print metadata\n      --tree      iterative recursive tree\n      --stats     print directory totals\n      --lua       load ~/.config/lsl/config.lua\n      --config F  load Lua file F\n      --no-sort   preserve kernel order\n      --dirs-first, --reverse\n");}
@@ -125,7 +145,19 @@ int main(int argc,char**argv){Options o={.path="."};for(int i=1;i<argc;i++){char
     Entries es={0};Totals totals={0};scan(&o,&es,&totals);sort_dirs_first=o.dirs_first;sort_reverse=o.reverse;if (!o.no_sort && !o.tree) qsort(es.data, es.length, sizeof(*es.data), compare_entries);
     size_t cap=OUTPUT_BUFFER,used=0;char*out=malloc(cap);if(!out)die("malloc");for(size_t i=0;i<es.length;i++){Entry*e=&es.data[i];
 #ifdef LSL_WITH_LUA
-        if(L&&!lua_accept(L,e))continue;if(L){size_t n;const char*s=lua_format(L,e,&n);if(s){append(&out,&used,&cap,s,n);append(&out,&used,&cap,"\n",1);lua_pop(L,1);continue;}}
+        if (L && !lua_accept(L, e)) {
+            continue;
+        }
+        if (L) {
+            size_t formatted_length;
+            const char *formatted = lua_format(L, e, &formatted_length);
+            if (formatted) {
+                append(&out, &used, &cap, formatted, formatted_length);
+                append(&out, &used, &cap, "\n", 1);
+                lua_pop(L, 1);
+                continue;
+            }
+        }
 #endif
         if(o.tree){for(unsigned d=0;d<e->depth;d++)append(&out,&used,&cap,"│  ",strlen("│  ")); append(&out,&used,&cap,"├─ ",strlen("├─ "));}if(o.long_mode){if(load_stat(e)<0)continue;char m[11];mode_string(e->mode,m);appendf(&out,&used,&cap,"%s %10" PRIu64 " ",m,e->size);}const char*c=color_for(e);appendf(&out,&used,&cap,"%s%s %s%s\033[0m\n",c,icon_for(e),e->name,type_is_dir(e->type)?"/":"");if(used>OUTPUT_BUFFER){if(write(STDOUT_FILENO,out,used)<0)die("write");used=0;}}
     if (o.stats) appendf(&out, &used, &cap, "\n%" PRIu64 " files, %" PRIu64 " directories, %" PRIu64 " links, %" PRIu64 " bytes\n", totals.files, totals.dirs, totals.links, totals.bytes);
