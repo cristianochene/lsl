@@ -1,414 +1,168 @@
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <fnmatch.h>
+#include <inttypes.h>
+#include <linux/limits.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
 #include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <time.h>
-#include <fnmatch.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
-#include <regex.h>
 
-// Lua Headers
+#ifdef LSL_WITH_LUA
 #include <lua.h>
-#include <lualib.h>
 #include <lauxlib.h>
+#include <lualib.h>
+#if LUA_VERSION_NUM < 502
+#define lua_rawlen lua_objlen
+#endif
+#endif
+
+#define DENTS_BUFFER (256U * 1024U)
+#define OUTPUT_BUFFER (256U * 1024U)
+#define INITIAL_ENTRIES 1024U
+
+struct linux_dirent64 { ino64_t d_ino; off64_t d_off; unsigned short d_reclen; unsigned char d_type; char d_name[]; };
 
 typedef struct {
-    char name[256];
-    char rel_path[4096];
-    char extension[32];
-    int is_dir;
-    int is_symlink;
-    int is_executable;
-    long size;
-    time_t modified_time;
-    char permissions[10];
-    int depth;
-} FileInfo;
+    const char *name;
+    const char *path;
+    uint64_t size;
+    int64_t mtime;
+    mode_t mode;
+    unsigned char type;
+    unsigned depth;
+    unsigned stat_loaded : 1;
+} Entry;
 
-// Global sorting state variables
-int g_dirs_first = 0;
-char g_sort_by[32] = "name";
-char g_sort_order[32] = "asc";
+typedef struct Block { struct Block *next; size_t used, capacity; char data[]; } Block;
+typedef struct { Block *head; } Arena;
+typedef struct { Entry *data; size_t length, capacity; } Entries;
+typedef struct { char *path; unsigned depth; } Work;
+typedef struct { Work *data; size_t length, capacity; } Stack;
+typedef struct { uint64_t files, dirs, links, bytes; } Totals;
+typedef struct {
+    int all, long_mode, tree, stats, dirs_first, reverse, no_sort;
+    int use_lua; const char *config; const char *path;
+} Options;
 
-void get_permissions(mode_t mode, char *str) {
-    str[0] = (mode & S_IRUSR) ? 'r' : '-';
-    str[1] = (mode & S_IWUSR) ? 'w' : '-';
-    str[2] = (mode & S_IXUSR) ? 'x' : '-';
-    str[3] = (mode & S_IRGRP) ? 'r' : '-';
-    str[4] = (mode & S_IWGRP) ? 'w' : '-';
-    str[5] = (mode & S_IXGRP) ? 'x' : '-';
-    str[6] = (mode & S_IROTH) ? 'r' : '-';
-    str[7] = (mode & S_IWOTH) ? 'w' : '-';
-    str[8] = (mode & S_IXOTH) ? 'x' : '-';
-    str[9] = '\0';
+static Arena names;
+static int sort_dirs_first, sort_reverse;
+
+static void die(const char *what) { perror(what); exit(EXIT_FAILURE); }
+static void *xrealloc(void *p, size_t n) { void *q = realloc(p, n); if (!q) die("realloc"); return q; }
+static void *arena_alloc(Arena *a, size_t n) {
+    n = (n + 7U) & ~7U;
+    if (!a->head || a->head->capacity - a->head->used < n) {
+        size_t cap = n > 65536U ? n : 65536U;
+        Block *b = malloc(sizeof(*b) + cap); if (!b) die("malloc");
+        b->next = a->head; b->used = 0; b->capacity = cap; a->head = b;
+    }
+    void *p = a->head->data + a->head->used; a->head->used += n; return p;
 }
-
-void extract_extension(const char *filename, char *ext, size_t max_len) {
-    const char *dot = strrchr(filename, '.');
-    if (!dot || dot == filename) {
-        ext[0] = '\0';
-    } else {
-        snprintf(ext, max_len, "%s", dot + 1);
-    }
+static char *arena_copy(Arena *a, const char *s) { size_t n = strlen(s)+1; char *p=arena_alloc(a,n); memcpy(p,s,n); return p; }
+static void arena_destroy(Arena *a) { while (a->head) { Block *n=a->head->next; free(a->head); a->head=n; } }
+static void entries_push(Entries *v, Entry e) { if(v->length==v->capacity){v->capacity=v->capacity?v->capacity*2:INITIAL_ENTRIES;v->data=xrealloc(v->data,v->capacity*sizeof(*v->data));}v->data[v->length++]=e; }
+static void stack_push(Stack *s, Work w) { if(s->length==s->capacity){s->capacity=s->capacity?s->capacity*2:64;s->data=xrealloc(s->data,s->capacity*sizeof(*s->data));}s->data[s->length++]=w; }
+static int type_is_dir(unsigned char t) { return t == DT_DIR; }
+static int type_is_link(unsigned char t) { return t == DT_LNK; }
+static const char *extension(const char *name) { const char *p=strrchr(name,'.'); return (!p||p==name)?"":p+1; }
+static const char *join_path(const char *base, const char *name) {
+    size_t a=strlen(base), b=strlen(name); char *p=arena_alloc(&names,a+b+2); memcpy(p,base,a); if(a&&base[a-1]!='/')p[a++]='/'; memcpy(p+a,name,b+1); return p;
 }
-
-int compare_files(const void *a, const void *b) {
-    const FileInfo *fileA = (const FileInfo *)a;
-    const FileInfo *fileB = (const FileInfo *)b;
-
-    if (g_dirs_first) {
-        if (fileA->is_dir && !fileB->is_dir) return -1;
-        if (!fileA->is_dir && fileB->is_dir) return 1;
-    }
-
-    int result = 0;
-    if (strcmp(g_sort_by, "size") == 0) {
-        if (fileA->size < fileB->size) result = -1;
-        else if (fileA->size > fileB->size) result = 1;
-        else result = strcasecmp(fileA->name, fileB->name);
-    } else if (strcmp(g_sort_by, "time") == 0) {
-        if (fileA->modified_time < fileB->modified_time) result = -1;
-        else if (fileA->modified_time > fileB->modified_time) result = 1;
-        else result = strcasecmp(fileA->name, fileB->name);
-    } else if (strcmp(g_sort_by, "type") == 0) {
-        result = strcasecmp(fileA->extension, fileB->extension);
-        if (result == 0) result = strcasecmp(fileA->name, fileB->name);
-    } else {
-        result = strcasecmp(fileA->rel_path, fileB->rel_path);
-    }
-
-    if (strcmp(g_sort_order, "desc") == 0) {
-        result = -result;
-    }
-
-    return result;
-}
-
-int should_ignore(lua_State *L, const char *filename) {
-    lua_getglobal(L, "ignore_patterns");
-    if (!lua_istable(L, -1)) {
-        lua_pop(L, 1);
-        return 0;
-    }
-
-    int ignore = 0;
-    size_t len = lua_rawlen(L, -1);
-    for (size_t i = 1; i <= len; i++) {
-        lua_rawgeti(L, -1, i);
-        if (lua_isstring(L, -1)) {
-            const char *pattern = lua_tostring(L, -1);
-            if (fnmatch(pattern, filename, 0) == 0) {
-                ignore = 1;
-                lua_pop(L, 1);
-                break;
-            }
-        }
-        lua_pop(L, 1);
-    }
-
-    lua_pop(L, 1);
-    return ignore;
-}
-
-int load_config(lua_State *L) {
-    if (access("config.lua", F_OK) == 0) {
-        if (luaL_dofile(L, "config.lua") == LUA_OK) return 1;
-    }
-
-    const char *home = getenv("HOME");
-    if (home != NULL) {
-        char global_path[1024];
-        snprintf(global_path, sizeof(global_path), "%s/.config/lsl/config.lua", home);
-        if (access(global_path, F_OK) == 0) {
-            if (luaL_dofile(L, global_path) == LUA_OK) return 1;
-        }
-    }
-
+static int load_stat(Entry *e) {
+    if (e->stat_loaded) return 0;
+    struct stat st; if (fstatat(AT_FDCWD,e->path,&st,AT_SYMLINK_NOFOLLOW)<0) return -1;
+    e->size=(uint64_t)st.st_size; e->mtime=(int64_t)st.st_mtime; e->mode=st.st_mode; e->stat_loaded=1;
+    if(e->type==DT_UNKNOWN) e->type=S_ISDIR(st.st_mode)?DT_DIR:S_ISLNK(st.st_mode)?DT_LNK:DT_REG;
     return 0;
 }
+static int compare_entries(const void *ap,const void *bp){const Entry*a=ap,*b=bp;if(sort_dirs_first&&type_is_dir(a->type)!=type_is_dir(b->type))return type_is_dir(a->type)?-1:1;int r=strverscmp(a->name,b->name);return sort_reverse?-r:r;}
 
-// Recursive file collection function
-void collect_files(lua_State *L, const char *base_path, const char *sub_path, 
-                   FileInfo **files, size_t *count, int depth, int max_depth, 
-                   int recursive, int show_hidden, regex_t *regex_filter, int use_regex) {
-
-    char current_dir_path[4096];
-    if (sub_path[0] != '\0') {
-        if (snprintf(current_dir_path, sizeof(current_dir_path), "%s/%s", base_path, sub_path) >= (int)sizeof(current_dir_path)) {
-            fprintf(stderr, "Warning: Path length exceeded limit: %s/%s\n", base_path, sub_path);
-            return;
-        }
-    } else {
-        if (snprintf(current_dir_path, sizeof(current_dir_path), "%s", base_path) >= (int)sizeof(current_dir_path)) {
-            fprintf(stderr, "Warning: Base path length exceeded limit: %s\n", base_path);
-            return;
-        }
-    }
-
-    DIR *dir = opendir(current_dir_path);
-    if (dir == NULL) return;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-        if (!show_hidden && entry->d_name[0] == '.') continue;
-        if (should_ignore(L, entry->d_name)) continue;
-
-        // Regular Expression filter
-        if (use_regex) {
-            if (regexec(regex_filter, entry->d_name, 0, NULL, 0) != 0) {
-                continue;
+static int scan(const Options *o, Entries *out, Totals *totals) {
+    Stack todo={0}; stack_push(&todo,(Work){arena_copy(&names,o->path),0}); char *buf=malloc(DENTS_BUFFER); if(!buf)die("malloc");
+    while(todo.length){Work w=todo.data[--todo.length];int fd=open(w.path,O_RDONLY|O_DIRECTORY|O_CLOEXEC);if(fd<0){fprintf(stderr,"lsl: %s: %s\n",w.path,strerror(errno));continue;}
+        for(;;){long n=syscall(SYS_getdents64,fd,buf,DENTS_BUFFER);if(n<0){fprintf(stderr,"lsl: %s: %s\n",w.path,strerror(errno));break;}if(!n)break;
+            for(long pos=0;pos<n;){struct linux_dirent64*d=(void*)(buf+pos);pos+=d->d_reclen;if(!strcmp(d->d_name,".")||!strcmp(d->d_name,"..")||(!o->all&&d->d_name[0]=='.'))continue;
+                const char *path=join_path(w.path,d->d_name);Entry e={arena_copy(&names,d->d_name),path,0,0,0,d->d_type,w.depth,0};
+                if((o->long_mode||o->stats||d->d_type==DT_UNKNOWN)&&load_stat(&e)<0)continue;
+                if(type_is_dir(e.type))totals->dirs++;else if(type_is_link(e.type))totals->links++;else totals->files++;if(e.stat_loaded)totals->bytes+=e.size;
+                entries_push(out,e);if(o->tree&&type_is_dir(e.type))stack_push(&todo,(Work){(char*)path,w.depth+1});
             }
-        }
-
-        char full_item_path[4096];
-        char rel_item_path[4096];
-        
-        int full_len = snprintf(full_item_path, sizeof(full_item_path), "%s/%s", current_dir_path, entry->d_name);
-        if (full_len < 0 || full_len >= (int)sizeof(full_item_path)) {
-            fprintf(stderr, "Warning: File path truncated, skipping: %s/%s\n", current_dir_path, entry->d_name);
-            continue;
-        }
-
-        if (sub_path[0] != '\0') {
-            int rel_len = snprintf(rel_item_path, sizeof(rel_item_path), "%s/%s", sub_path, entry->d_name);
-            if (rel_len < 0 || rel_len >= (int)sizeof(rel_item_path)) {
-                continue;
-            }
-        } else {
-            snprintf(rel_item_path, sizeof(rel_item_path), "%s", entry->d_name);
-        }
-
-        struct stat file_stat;
-        struct stat lstat_buf;
-        int is_symlink = 0;
-
-        if (lstat(full_item_path, &lstat_buf) == 0 && S_ISLNK(lstat_buf.st_mode)) {
-            is_symlink = 1;
-        }
-
-        int stat_ok = (stat(full_item_path, &file_stat) == 0);
-        int is_dir = stat_ok ? S_ISDIR(file_stat.st_mode) : 0;
-
-        *files = realloc(*files, sizeof(FileInfo) * (*count + 1));
-        
-        snprintf((*files)[*count].name, sizeof((*files)[*count].name), "%s", entry->d_name);
-        snprintf((*files)[*count].rel_path, sizeof((*files)[*count].rel_path), "%s", rel_item_path);
-        extract_extension(entry->d_name, (*files)[*count].extension, sizeof((*files)[*count].extension));
-
-        (*files)[*count].is_dir = is_dir;
-        (*files)[*count].is_symlink = is_symlink;
-        (*files)[*count].depth = depth;
-
-        if (stat_ok) {
-            (*files)[*count].size = file_stat.st_size;
-            (*files)[*count].modified_time = file_stat.st_mtime;
-            get_permissions(file_stat.st_mode, (*files)[*count].permissions);
-
-            (*files)[*count].is_executable = !is_dir && ((file_stat.st_mode & S_IXUSR) ||
-                                                          (file_stat.st_mode & S_IXGRP) ||
-                                                          (file_stat.st_mode & S_IXOTH));
-        } else {
-            (*files)[*count].size = 0;
-            (*files)[*count].modified_time = 0;
-            (*files)[*count].is_executable = 0;
-            strcpy((*files)[*count].permissions, "---------");
-        }
-
-        (*count)++;
-
-        // Recurse into subdirectories if enabled and within max_depth limits
-        if (is_dir && recursive && (max_depth == 0 || depth < max_depth)) {
-            collect_files(L, base_path, rel_item_path, files, count, depth + 1, max_depth, recursive, show_hidden, regex_filter, use_regex);
-        }
-    }
-
-    closedir(dir);
+        }close(fd);
+    }free(buf);free(todo.data);return 0;
 }
 
-// Formats a file entry using the Lua format_entry function
-void print_formatted_entry(lua_State *L, FileInfo *file, int recursive) {
-    lua_getglobal(L, "format_entry");
+static void mode_string(mode_t m,char p[11]){const char chars[]="rwxrwxrwx";p[0]=S_ISDIR(m)?'d':S_ISLNK(m)?'l':'-';for(int i=0;i<9;i++)p[i+1]=(m&(1U<<(8-i)))?chars[i]:'-';p[10]=0;}
+static const char *icon_for(const Entry *e){if(type_is_dir(e->type))return "";if(type_is_link(e->type))return "";const char*x=extension(e->name);if(!strcmp(x,"c")||!strcmp(x,"h"))return "";if(!strcmp(x,"lua"))return "";if(!strcmp(x,"md"))return "";return "";}
+static const char *color_for(const Entry *e){if(type_is_dir(e->type))return "\033[1;34m";if(type_is_link(e->type))return "\033[36m";if(e->stat_loaded&&(e->mode&0111))return "\033[1;32m";return "";}
+static void append(char **buf,size_t *used,size_t *cap,const char *s,size_t n){if(*used+n>*cap){while(*used+n>*cap)*cap*=2;*buf=xrealloc(*buf,*cap);}memcpy(*buf+*used,s,n);*used+=n;}
+static void appendf(char **buf,size_t*u,size_t*c,const char *fmt,...){va_list ap;va_start(ap,fmt);char tmp[512];int n=vsnprintf(tmp,sizeof tmp,fmt,ap);va_end(ap);if(n>0)append(buf,u,c,tmp,(size_t)n<sizeof tmp?(size_t)n:sizeof(tmp)-1);}
 
+#ifdef LSL_WITH_LUA
+static Entry *lua_entry(lua_State *L){return *(Entry**)luaL_checkudata(L,1,"lsl.entry");}
+static int entry_index(lua_State *L){Entry*e=lua_entry(L);const char*k=luaL_checkstring(L,2);if(!strcmp(k,"name"))lua_pushstring(L,e->name);else if(!strcmp(k,"path"))lua_pushstring(L,e->path);else if(!strcmp(k,"extension"))lua_pushstring(L,extension(e->name));else if(!strcmp(k,"is_dir"))lua_pushboolean(L,type_is_dir(e->type));else if(!strcmp(k,"is_symlink"))lua_pushboolean(L,type_is_link(e->type));else if(!strcmp(k,"depth"))lua_pushinteger(L,e->depth);else {if(load_stat(e)<0)lua_pushnil(L);else if(!strcmp(k,"size"))lua_pushinteger(L,(lua_Integer)e->size);else if(!strcmp(k,"mtime"))lua_pushinteger(L,e->mtime);else if(!strcmp(k,"mode"))lua_pushinteger(L,e->mode);else if(!strcmp(k,"is_executable"))lua_pushboolean(L,(e->mode&0111)!=0);else lua_pushnil(L);}return 1;}
+static int push_entry(lua_State*L,Entry*e){Entry**u=lua_newuserdata(L,sizeof(*u));*u=e;luaL_getmetatable(L,"lsl.entry");lua_setmetatable(L,-2);return 1;}
+static lua_State *start_lua(const char *path){lua_State*L=luaL_newstate();if(!L)return NULL;luaL_openlibs(L);luaL_newmetatable(L,"lsl.entry");lua_pushcfunction(L,entry_index);lua_setfield(L,-2,"__index");lua_pop(L,1);if(luaL_dofile(L,path)!=LUA_OK){fprintf(stderr,"lsl: %s\n",lua_tostring(L,-1));lua_close(L);return NULL;}return L;}
+static int lua_accept(lua_State*L,Entry*e){lua_getglobal(L,"filter_entry");if(!lua_isfunction(L,-1)){lua_pop(L,1);return 1;}push_entry(L,e);if(lua_pcall(L,1,1,0)!=LUA_OK){fprintf(stderr,"lsl: filter_entry: %s\n",lua_tostring(L,-1));lua_pop(L,1);return 0;}int ok=lua_toboolean(L,-1);lua_pop(L,1);return ok;}
+static const char *lua_format(lua_State *L, Entry *e, size_t *length) {
+    lua_getglobal(L, "format_entry");
     if (!lua_isfunction(L, -1)) {
         lua_pop(L, 1);
-        printf("%s", recursive ? file->rel_path : file->name);
-        return;
+        return NULL;
     }
 
-    lua_newtable(L);
-
-    lua_pushstring(L, recursive ? file->rel_path : file->name);
-    lua_setfield(L, -2, "name");
-
-    lua_pushstring(L, file->extension);
-    lua_setfield(L, -2, "extension");
-
-    lua_pushboolean(L, file->is_dir);
-    lua_setfield(L, -2, "is_dir");
-
-    lua_pushboolean(L, file->is_symlink);
-    lua_setfield(L, -2, "is_symlink");
-
-    lua_pushboolean(L, file->is_executable);
-    lua_setfield(L, -2, "is_executable");
-
-    lua_pushinteger(L, file->size);
-    lua_setfield(L, -2, "size");
-
-    lua_pushinteger(L, file->modified_time);
-    lua_setfield(L, -2, "modified_time");
-
+    push_entry(L, e);
     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-        fprintf(stderr, "Error executing format_entry: %s\n", lua_tostring(L, -1));
+        fprintf(stderr, "lsl: format_entry: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
-        return;
+        return NULL;
     }
 
-    const char *formatted_name = lua_tostring(L, -1);
-    printf("%s", formatted_name);
-    lua_pop(L, 1);
+    const char *formatted = lua_tolstring(L, -1, length);
+    if (!formatted) {
+        fprintf(stderr, "lsl: format_entry must return a string\n");
+        lua_pop(L, 1);
+    }
+    return formatted;
 }
+#endif
 
-int main(int argc, char *argv[]) {
-    lua_State *L = luaL_newstate();
-    if (L == NULL) {
-        fprintf(stderr, "Error initializing Lua.\n");
-        return 1;
-    }
-
-    luaL_openlibs(L);
-
-    if (!load_config(L)) {
-        fprintf(stderr, "Warning: Running with fallback configuration.\n");
-    }
-
-    // Read default configuration from Lua
-    lua_getglobal(L, "show_hidden");
-    int show_hidden = lua_toboolean(L, -1);
-    lua_pop(L, 1);
-
-    lua_getglobal(L, "dirs_first");
-    if (!lua_isnil(L, -1)) g_dirs_first = lua_toboolean(L, -1);
-    lua_pop(L, 1);
-
-    lua_getglobal(L, "recursive");
-    int recursive = lua_toboolean(L, -1);
-    lua_pop(L, 1);
-
-    int max_depth = 1;
-    lua_getglobal(L, "max_depth");
-    if (lua_isnumber(L, -1)) max_depth = (int)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-    int columns = 4;
-    lua_getglobal(L, "columns");
-    if (lua_isnumber(L, -1)) columns = (int)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-    int column_width = 32;
-    lua_getglobal(L, "column_width");
-    if (lua_isnumber(L, -1)) column_width = (int)lua_tointeger(L, -1);
-    lua_pop(L, 1);
-
-    // Auto-detect terminal width and calculate max fitting columns
-    struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) {
-        int auto_cols = w.ws_col / column_width;
-        if (auto_cols > 0) {
-            columns = auto_cols;
+static void usage(FILE*f){fprintf(f,"Usage: lsl [OPTIONS] [DIR]\n  -a, --all       show hidden entries\n  -l, --long      load and print metadata\n      --tree      iterative recursive tree\n      --stats     print directory totals\n      --lua       load ~/.config/lsl/config.lua\n      --config F  load Lua file F\n      --no-sort   preserve kernel order\n      --dirs-first, --reverse\n");}
+int main(int argc,char**argv){Options o={.path="."};for(int i=1;i<argc;i++){char*a=argv[i];if(!strcmp(a,"-a")||!strcmp(a,"--all"))o.all=1;else if(!strcmp(a,"-l")||!strcmp(a,"--long"))o.long_mode=1;else if(!strcmp(a,"--tree"))o.tree=1;else if(!strcmp(a,"--stats"))o.stats=1;else if(!strcmp(a,"--dirs-first"))o.dirs_first=1;else if(!strcmp(a,"--reverse"))o.reverse=1;else if(!strcmp(a,"--no-sort"))o.no_sort=1;else if(!strcmp(a,"--lua"))o.use_lua=1;else if(!strcmp(a,"--config")&&i+1<argc)o.config=argv[++i],o.use_lua=1;else if(!strcmp(a,"-h")||!strcmp(a,"--help")){usage(stdout);return 0;}else if(a[0]=='-'){usage(stderr);return 2;}else o.path=a;}
+#ifdef LSL_WITH_LUA
+    char cfg[PATH_MAX];lua_State*L=NULL;if(o.use_lua){if(!o.config){const char*h=getenv("HOME");if(!h){fprintf(stderr,"lsl: HOME is unset\n");return 1;}snprintf(cfg,sizeof cfg,"%s/.config/lsl/config.lua",h);o.config=cfg;}L=start_lua(o.config);if(!L)return 1;}
+#else
+    if(o.use_lua){fprintf(stderr,"lsl: built without Lua support\n");return 1;}
+#endif
+    Entries es={0};Totals totals={0};scan(&o,&es,&totals);sort_dirs_first=o.dirs_first;sort_reverse=o.reverse;if (!o.no_sort && !o.tree) qsort(es.data, es.length, sizeof(*es.data), compare_entries);
+    size_t cap=OUTPUT_BUFFER,used=0;char*out=malloc(cap);if(!out)die("malloc");for(size_t i=0;i<es.length;i++){Entry*e=&es.data[i];
+#ifdef LSL_WITH_LUA
+        if (L && !lua_accept(L, e)) {
+            continue;
         }
-    }
-
-    char regex_pattern[256] = "";
-    int use_regex = 0;
-
-    const char *target_dir = ".";
-
-    // Parse CLI options
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--all") == 0) {
-            show_hidden = 1;
-        } else if (strcmp(argv[i], "-R") == 0 || strcmp(argv[i], "--recursive") == 0) {
-            recursive = 1;
-        } else if (strcmp(argv[i], "--dirs-first") == 0) {
-            g_dirs_first = 1;
-        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--regex") == 0) {
-            if (i + 1 < argc) {
-                snprintf(regex_pattern, sizeof(regex_pattern), "%s", argv[i + 1]);
-                use_regex = 1;
-                i++;
-            }
-        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--max-depth") == 0) {
-            if (i + 1 < argc) {
-                max_depth = atoi(argv[i + 1]);
-                i++;
-            }
-        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--columns") == 0) {
-            if (i + 1 < argc) {
-                columns = atoi(argv[i + 1]);
-                i++;
-            }
-        } else if (argv[i][0] != '-') {
-            target_dir = argv[i];
-        }
-    }
-
-    // Compile regex pattern if provided
-    regex_t regex_filter;
-    if (use_regex) {
-        if (regcomp(&regex_filter, regex_pattern, REG_EXTENDED | REG_NOSUB) != 0) {
-            fprintf(stderr, "Error: Invalid regular expression '%s'\n", regex_pattern);
-            lua_close(L);
-            return 1;
-        }
-    }
-
-    FileInfo *files = NULL;
-    size_t count = 0;
-
-    // Collect directory entries
-    collect_files(L, target_dir, "", &files, &count, 1, max_depth, recursive, show_hidden, &regex_filter, use_regex);
-
-    if (use_regex) {
-        regfree(&regex_filter);
-    }
-
-    // Sort entries
-    qsort(files, count, sizeof(FileInfo), compare_files);
-
-    // Switch layout mode if recursive traversal is enabled
-    if (recursive) {
-        lua_pushstring(L, "tree");
-        lua_setglobal(L, "layout_mode");
-    }
-
-    // Render output
-    if (count > 0) {
-        if (recursive) {
-            for (size_t i = 0; i < count; i++) {
-                print_formatted_entry(L, &files[i], recursive);
-                printf("\n");
-            }
-        } else {
-            // Vertical grid rendering (top-to-bottom, left-to-right)
-            int rows = (count + columns - 1) / columns;
-            for (int r = 0; r < rows; r++) {
-                for (int c = 0; c < columns; c++) {
-                    int idx = c * rows + r;
-                    if (idx < (int)count) {
-                        print_formatted_entry(L, &files[idx], recursive);
-                    }
-                }
-                printf("\n");
+        if (L) {
+            size_t formatted_length;
+            const char *formatted = lua_format(L, e, &formatted_length);
+            if (formatted) {
+                append(&out, &used, &cap, formatted, formatted_length);
+                append(&out, &used, &cap, "\n", 1);
+                lua_pop(L, 1);
+                continue;
             }
         }
-    }
-
-    free(files);
-    lua_close(L);
-
-    return 0;
-}
+#endif
+        if(o.tree){for(unsigned d=0;d<e->depth;d++)append(&out,&used,&cap,"│  ",strlen("│  ")); append(&out,&used,&cap,"├─ ",strlen("├─ "));}if(o.long_mode){if(load_stat(e)<0)continue;char m[11];mode_string(e->mode,m);appendf(&out,&used,&cap,"%s %10" PRIu64 " ",m,e->size);}const char*c=color_for(e);appendf(&out,&used,&cap,"%s%s %s%s\033[0m\n",c,icon_for(e),e->name,type_is_dir(e->type)?"/":"");if(used>OUTPUT_BUFFER){if(write(STDOUT_FILENO,out,used)<0)die("write");used=0;}}
+    if (o.stats) appendf(&out, &used, &cap, "\n%" PRIu64 " files, %" PRIu64 " directories, %" PRIu64 " links, %" PRIu64 " bytes\n", totals.files, totals.dirs, totals.links, totals.bytes);
+    if (used && write(STDOUT_FILENO, out, used) < 0) die("write");
+#ifdef LSL_WITH_LUA
+    if(L)lua_close(L);
+#endif
+    free(out);free(es.data);arena_destroy(&names);return 0;}
