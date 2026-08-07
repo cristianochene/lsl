@@ -42,7 +42,8 @@ Available fields are `name`, `path`, `extension`, `is_dir`, `is_symlink`, `depth
 * iterative tree traversal (`--tree`), hidden entries (`-a`), and directory-first sorting (`--dirs-first`);
 * Lua filters and formatting through `--lua` or `--config FILE`;
 * a statistics footer (`--stats`) containing file, directory, link, and byte totals;
-* reverse sorting (`--reverse`) and sorting bypass (`--no-sort`).
+* reverse sorting (`--reverse`) and sorting bypass (`--no-sort`);
+* built-in command-line help through `-h` or `--help`.
 
 ## Building
 
