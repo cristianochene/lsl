@@ -50,12 +50,13 @@ Available fields are `name`, `path`, `extension`, `is_dir`, `is_symlink`, `depth
 ### Dependencies
 
 ```bash
-# Debian/Ubuntu — choose Lua or LuaJIT
-sudo apt install build-essential pkg-config liblua5.4-dev
+# Debian/Ubuntu — choose an available Lua version or LuaJIT
+sudo apt install build-essential pkg-config liblua5.5-dev
+# sudo apt install build-essential pkg-config liblua5.4-dev
 # sudo apt install build-essential pkg-config libluajit-5.1-dev
 ```
 
-The Makefile searches for `luajit`, `lua5.4`, `lua5.3`, and `lua`, in that order, through `pkg-config`. If no Lua development package is available, it deliberately builds a C-only fast-path binary; that binary reports a clear error when Lua options are requested.
+The Makefile searches for `luajit`, `lua5.5`, `lua5.4`, `lua5.3`, and `lua`, in that order, through `pkg-config`. If no Lua development package is available, it deliberately builds a C-only fast-path binary; that binary reports a clear error when Lua options are requested.
 
 ```bash
 make clean && make
@@ -66,8 +67,8 @@ The default optimized profile is equivalent to:
 
 ```bash
 gcc -std=c11 -O3 -march=native -flto -Wall -Wextra -Wpedantic \
-  $(pkg-config --cflags lua5.4) -DLSL_WITH_LUA main.c -o lsl \
-  -flto $(pkg-config --libs lua5.4)
+  $(pkg-config --cflags lua5.5) -DLSL_WITH_LUA main.c -o lsl \
+  -flto $(pkg-config --libs lua5.5)
 ```
 
 To use Clang or produce a binary without host-specific instructions:
