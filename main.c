@@ -135,10 +135,33 @@ static const char *lua_format(lua_State *L, Entry *e, size_t *length) {
 }
 #endif
 
-static void usage(FILE*f){fprintf(f,"Usage: lsl [OPTIONS] [DIR]\n  -a, --all       show hidden entries\n  -l, --long      load and print metadata\n  -h, --help      show this help and exit\n      --tree      iterative recursive tree\n      --stats     print directory totals\n      --lua       load ~/.config/lsl/config.lua\n      --config F  load Lua file F\n      --no-sort   preserve kernel order\n      --dirs-first, --reverse\n");}
+#ifdef LSL_WITH_LUA
+static int default_config_path(char *path, size_t size) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    int length;
+
+    if (xdg && xdg[0] == '/')
+        length = snprintf(path, size, "%s/lsl/config.lua", xdg);
+    else if (home && *home)
+        length = snprintf(path, size, "%s/.config/lsl/config.lua", home);
+    else {
+        fprintf(stderr, "lsl: cannot locate config.lua: HOME and XDG_CONFIG_HOME are unset\n");
+        return -1;
+    }
+
+    if (length < 0 || (size_t)length >= size) {
+        fprintf(stderr, "lsl: config.lua path is too long\n");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+static void usage(FILE*f){fprintf(f,"Usage: lsl [OPTIONS] [DIR]\n  -a, --all       show hidden entries\n  -l, --long      load and print metadata\n  -h, --help      show this help and exit\n      --tree      iterative recursive tree\n      --stats     print directory totals\n      --lua       load config.lua from the user config directory\n      --config F  load Lua file F\n      --no-sort   preserve kernel order\n      --dirs-first, --reverse\n");}
 int main(int argc,char**argv){Options o={.path="."};for(int i=1;i<argc;i++){char*a=argv[i];if(!strcmp(a,"-a")||!strcmp(a,"--all"))o.all=1;else if(!strcmp(a,"-l")||!strcmp(a,"--long"))o.long_mode=1;else if(!strcmp(a,"--tree"))o.tree=1;else if(!strcmp(a,"--stats"))o.stats=1;else if(!strcmp(a,"--dirs-first"))o.dirs_first=1;else if(!strcmp(a,"--reverse"))o.reverse=1;else if(!strcmp(a,"--no-sort"))o.no_sort=1;else if(!strcmp(a,"--lua"))o.use_lua=1;else if(!strcmp(a,"--config")&&i+1<argc)o.config=argv[++i],o.use_lua=1;else if(!strcmp(a,"-h")||!strcmp(a,"--help")){usage(stdout);return 0;}else if(a[0]=='-'){usage(stderr);return 2;}else o.path=a;}
 #ifdef LSL_WITH_LUA
-    char cfg[PATH_MAX];lua_State*L=NULL;if(o.use_lua){if(!o.config){const char*h=getenv("HOME");if(!h){fprintf(stderr,"lsl: HOME is unset\n");return 1;}snprintf(cfg,sizeof cfg,"%s/.config/lsl/config.lua",h);o.config=cfg;}L=start_lua(o.config);if(!L)return 1;}
+    char cfg[PATH_MAX];lua_State*L=NULL;if(o.use_lua){if(!o.config){if(default_config_path(cfg,sizeof cfg)<0)return 1;o.config=cfg;}L=start_lua(o.config);if(!L)return 1;}
 #else
     if(o.use_lua){fprintf(stderr,"lsl: built without Lua support\n");return 1;}
 #endif

@@ -85,7 +85,7 @@ lsl                       # C fast path in the current directory
 lsl -a --dirs-first /tmp
 lsl -l --stats ~/src
 lsl --tree --no-sort .
-lsl --lua                 # load ~/.config/lsl/config.lua
+lsl --lua                 # load $XDG_CONFIG_HOME/lsl/config.lua or ~/.config/lsl/config.lua
 lsl --config ./config.lua # load an explicit theme/filter
 ```
 
@@ -96,6 +96,12 @@ mkdir -p ~/.config/lsl
 cp config.lua ~/.config/lsl/config.lua
 lsl --lua
 ```
+
+When `XDG_CONFIG_HOME` is an absolute path, `--lua` loads
+`$XDG_CONFIG_HOME/lsl/config.lua`. Otherwise it falls back to
+`$HOME/.config/lsl/config.lua`. The file must contain valid Lua source; do not
+include Markdown escape backslashes such as `\_`, `\:`, or `\~=` when copying
+the example.
 
 Run `lsl --help` for the concise command-line reference.
 
