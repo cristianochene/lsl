@@ -304,6 +304,7 @@ int main(int argc, char *argv[]) {
     lua_pop(L, 1);
 
     int columns = 4;
+    int columns_explicit = 0;
     lua_getglobal(L, "columns");
     if (lua_isnumber(L, -1)) columns = (int)lua_tointeger(L, -1);
     lua_pop(L, 1);
@@ -313,14 +314,12 @@ int main(int argc, char *argv[]) {
     if (lua_isnumber(L, -1)) column_width = (int)lua_tointeger(L, -1);
     lua_pop(L, 1);
 
-    // Auto-detect terminal width and calculate max fitting columns
+    // Detect terminal width. The final number of columns is calculated after
+    // collecting the entries, using the longest complete filename.
     struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) {
-        int auto_cols = w.ws_col / column_width;
-        if (auto_cols > 0) {
-            columns = auto_cols;
-        }
-    }
+    int terminal_width = 0;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
+        terminal_width = w.ws_col;
 
     char regex_pattern[256] = "";
     int use_regex = 0;
@@ -349,6 +348,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--columns") == 0) {
             if (i + 1 < argc) {
                 columns = atoi(argv[i + 1]);
+                columns_explicit = 1;
                 i++;
             }
         } else if (argv[i][0] != '-') {
@@ -371,6 +371,27 @@ int main(int argc, char *argv[]) {
 
     // Collect directory entries
     collect_files(L, target_dir, "", &files, &count, 1, max_depth, recursive, show_hidden, &regex_filter, use_regex);
+
+    // Never truncate filenames to fit a fixed grid. Grow the column to the
+    // longest name and reduce the number of columns to fit the terminal.
+    if (!recursive && count > 0) {
+        size_t longest_name = 0;
+        for (size_t i = 0; i < count; i++) {
+            size_t name_len = strlen(files[i].name);
+            if (name_len > longest_name) longest_name = name_len;
+        }
+
+        int required_width = (int)longest_name + 2;
+        if (required_width > column_width) column_width = required_width;
+
+        lua_pushinteger(L, column_width);
+        lua_setglobal(L, "column_width");
+
+        if (!columns_explicit && terminal_width > 0) {
+            int auto_cols = terminal_width / column_width;
+            columns = auto_cols > 0 ? auto_cols : 1;
+        }
+    }
 
     if (use_regex) {
         regfree(&regex_filter);
