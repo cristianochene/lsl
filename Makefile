@@ -6,7 +6,7 @@ CFLAGS ?= -O3 -march=native -flto
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS ?= -flto
 
-LUA_PKG := $(shell for p in luajit lua5.4 lua5.3 lua; do $(PKG_CONFIG) --exists $$p 2>/dev/null && { echo $$p; break; }; done)
+LUA_PKG := $(shell for p in luajit lua5.5 lua5.4 lua5.3 lua; do $(PKG_CONFIG) --exists $$p 2>/dev/null && { echo $$p; break; }; done)
 ifneq ($(LUA_PKG),)
 CPPFLAGS += -DLSL_WITH_LUA $(shell $(PKG_CONFIG) --cflags $(LUA_PKG))
 LDLIBS += $(shell $(PKG_CONFIG) --libs $(LUA_PKG))

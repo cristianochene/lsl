@@ -50,12 +50,13 @@ Available fields are `name`, `path`, `extension`, `is_dir`, `is_symlink`, `depth
 ### Dependencies
 
 ```bash
-# Debian/Ubuntu — choose Lua or LuaJIT
-sudo apt install build-essential pkg-config liblua5.4-dev
+# Debian/Ubuntu — choose an available Lua version or LuaJIT
+sudo apt install build-essential pkg-config liblua5.5-dev
+# sudo apt install build-essential pkg-config liblua5.4-dev
 # sudo apt install build-essential pkg-config libluajit-5.1-dev
 ```
 
-The Makefile searches for `luajit`, `lua5.4`, `lua5.3`, and `lua`, in that order, through `pkg-config`. If no Lua development package is available, it deliberately builds a C-only fast-path binary; that binary reports a clear error when Lua options are requested.
+The Makefile searches for `luajit`, `lua5.5`, `lua5.4`, `lua5.3`, and `lua`, in that order, through `pkg-config`. If no Lua development package is available, it deliberately builds a C-only fast-path binary; that binary reports a clear error when Lua options are requested.
 
 ```bash
 make clean && make
@@ -66,8 +67,8 @@ The default optimized profile is equivalent to:
 
 ```bash
 gcc -std=c11 -O3 -march=native -flto -Wall -Wextra -Wpedantic \
-  $(pkg-config --cflags lua5.4) -DLSL_WITH_LUA main.c -o lsl \
-  -flto $(pkg-config --libs lua5.4)
+  $(pkg-config --cflags lua5.5) -DLSL_WITH_LUA main.c -o lsl \
+  -flto $(pkg-config --libs lua5.5)
 ```
 
 To use Clang or produce a binary without host-specific instructions:
@@ -84,7 +85,7 @@ lsl                       # C fast path in the current directory
 lsl -a --dirs-first /tmp
 lsl -l --stats ~/src
 lsl --tree --no-sort .
-lsl --lua                 # load ~/.config/lsl/config.lua
+lsl --lua                 # load $XDG_CONFIG_HOME/lsl/config.lua or ~/.config/lsl/config.lua
 lsl --config ./config.lua # load an explicit theme/filter
 ```
 
@@ -95,6 +96,12 @@ mkdir -p ~/.config/lsl
 cp config.lua ~/.config/lsl/config.lua
 lsl --lua
 ```
+
+When `XDG_CONFIG_HOME` is an absolute path, `--lua` loads
+`$XDG_CONFIG_HOME/lsl/config.lua`. Otherwise it falls back to
+`$HOME/.config/lsl/config.lua`. The file must contain valid Lua source; do not
+include Markdown escape backslashes such as `\_`, `\:`, or `\~=` when copying
+the example.
 
 Run `lsl --help` for the concise command-line reference.
 
