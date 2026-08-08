@@ -94,12 +94,6 @@ function format_entry(file)
 		colored_size = " " .. GRAY .. "(" .. formatted .. ")" .. RESET
 	end
 
-	-- Truncate filename if total entry length exceeds column_width - 2 spaces
-	local max_name_len = column_width - string.len(raw_size) - 2
-	if max_name_len > 5 and string.len(display_name) > max_name_len then
-		display_name = string.sub(display_name, 1, max_name_len - 3) .. "..."
-	end
-
 	-- Exact visible length calculation
 	local visible_len = string.len(display_name) + string.len(raw_size)
 	local pad_len = column_width - visible_len
